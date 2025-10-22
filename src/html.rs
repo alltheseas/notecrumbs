@@ -55,8 +55,8 @@ fn collapse_whitespace<S: AsRef<str>>(input: S) -> String {
 fn extract_article_metadata(note: &Note) -> ArticleMetadata {
     let mut meta = ArticleMetadata::default();
 
-    for tag in note.tags().iter() {
-        let mut iter = tag.clone().into_iter();
+    for tag in note.tags() {
+        let mut iter = tag.into_iter();
         let Some(tag_kind) = iter.next().and_then(|nstr| nstr.variant().str()) else {
             continue;
         };
@@ -194,7 +194,7 @@ pub fn render_note_content(body: &mut Vec<u8>, note: &Note, blocks: &Blocks) {
             }
 
             BlockType::Text => {
-                let text = html_escape::encode_text(block.as_str());
+                let text = html_escape::encode_text(block.as_str()).replace("\n", "<br/>");
                 let _ = write!(body, r"{}", text);
             }
 

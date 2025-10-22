@@ -1,3 +1,4 @@
+use crate::timeout;
 use crate::{abbrev::abbrev_str, error::Result, fonts, nip19, Error, Notecrumbs};
 use egui::epaint::Shadow;
 use egui::{
@@ -289,7 +290,7 @@ fn query_note_by_address<'a>(
         results = ndb.query(txn, &[coord_filter], 1)?;
     }
     if let Some(result) = results.first() {
-        ndb.get_note_by_key(txn, result.note_key)
+        Ok(result.note.clone())
     } else {
         Err(nostrdb::Error::NotFound)
     }
@@ -316,13 +317,13 @@ pub async fn find_note(
     }
 
     client
-        .connect_with_timeout(std::time::Duration::from_millis(800))
+        .connect_with_timeout(timeout::get_env_timeout())
         .await;
 
     debug!("finding note(s) with filters: {:?}", filters);
 
     let mut streamed_events = client
-        .stream_events(filters, Some(std::time::Duration::from_millis(2000)))
+        .stream_events(filters, Some(timeout::get_env_timeout()))
         .await?;
 
     let mut num_loops = 0;
@@ -500,7 +501,7 @@ pub fn get_render_data(ndb: &Ndb, txn: &Transaction, nip19: &Nip19) -> Result<Re
                     NoteRenderData::Address {
                         author,
                         kind,
-                        identifier: identifier.clone(),
+                        identifier,
                     }
                 }
             };
@@ -844,10 +845,10 @@ mod tests {
     use super::*;
     use nostr::nips::nip01::Coordinate;
     use nostr::prelude::{EventBuilder, Keys, Tag};
-    use nostrdb::Config;
+    use nostrdb::{Config, Filter};
     use std::fs;
     use std::path::PathBuf;
-    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_db_dir(prefix: &str) -> PathBuf {
         let base = PathBuf::from("target/test-dbs");
@@ -859,23 +860,6 @@ mod tests {
         let dir = base.join(format!("{}-{}", prefix, nanos));
         let _ = fs::create_dir_all(&dir);
         dir
-    }
-
-    fn wait_for_note(ndb: &Ndb, note_id: &[u8; 32]) {
-        let deadline = Instant::now() + Duration::from_millis(500);
-        loop {
-            if let Ok(txn) = Transaction::new(ndb) {
-                if ndb.get_note_by_id(&txn, note_id).is_ok() {
-                    return;
-                }
-            }
-
-            if Instant::now() >= deadline {
-                panic!("timed out waiting for note ingestion");
-            }
-
-            std::thread::sleep(Duration::from_millis(10));
-        }
     }
 
     #[test]
@@ -905,8 +889,8 @@ mod tests {
         assert!(saw_d_tag, "expected filter to include a 'd' tag constraint");
     }
 
-    #[test]
-    fn query_note_by_address_uses_d_and_a_tag_filters() {
+    #[tokio::test]
+    async fn query_note_by_address_uses_d_and_a_tag_filters() {
         let keys = Keys::generate();
         let author = keys.public_key().to_bytes();
         let kind = Kind::LongFormTextNote.as_u16() as u64;
@@ -930,28 +914,29 @@ mod tests {
             .sign_with_keys(&keys)
             .expect("sign long-form event with coordinate tag");
 
+        let wait_filter = Filter::new().ids([event_with_d.id.as_bytes()]).build();
+        let wait_filter_2 = Filter::new().ids([event_with_a_only.id.as_bytes()]).build();
+
         ndb.process_event(&serde_json::to_string(&event_with_d).unwrap())
             .expect("ingest event with d tag");
         ndb.process_event(&serde_json::to_string(&event_with_a_only).unwrap())
             .expect("ingest event with a tag");
 
-        let event_with_d_id = event_with_d.id.to_bytes();
-        let event_with_a_only_id = event_with_a_only.id.to_bytes();
-        wait_for_note(&ndb, &event_with_d_id);
-        wait_for_note(&ndb, &event_with_a_only_id);
+        let sub_id = ndb.subscribe(&[wait_filter, wait_filter_2]).expect("sub");
+        let _r = ndb.wait_for_notes(sub_id, 2).await;
 
         {
             let txn = Transaction::new(&ndb).expect("transaction for d-tag lookup");
             let note = query_note_by_address(&ndb, &txn, &author, kind, identifier_with_d)
                 .expect("should find event by d tag");
-            assert_eq!(note.id(), &event_with_d_id);
+            assert_eq!(note.id(), event_with_d.id.as_bytes());
         }
 
         {
             let txn = Transaction::new(&ndb).expect("transaction for a-tag lookup");
             let note = query_note_by_address(&ndb, &txn, &author, kind, identifier_with_a)
                 .expect("should find event via a-tag fallback");
-            assert_eq!(note.id(), &event_with_a_only_id);
+            assert_eq!(note.id(), event_with_a_only.id.as_bytes());
         }
 
         drop(ndb);
